@@ -1,6 +1,7 @@
 
 import streamlit as st
 import requests
+import time
 from datetime import datetime, timedelta, timezone
 
 st.set_page_config(
@@ -10,9 +11,7 @@ st.set_page_config(
 )
 
 st.title("🌍 IR World News Assistant")
-st.write(
-    "International news for International Relations students"
-)
+st.write("International news for International Relations students")
 
 category = st.selectbox(
     "Choose a topic",
@@ -35,33 +34,52 @@ queries = {
     "Mongolia Foreign Policy": "Mongolia foreign policy diplomacy"
 }
 
+
+@st.cache_data(ttl=600)
+def get_news(query):
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(days=7)
+
+    params = {
+        "query": query,
+        "mode": "ArtList",
+        "format": "json",
+        "maxrecords": 10,
+        "sort": "DateDesc",
+        "startdatetime": start.strftime("%Y%m%d%H%M%S"),
+        "enddatetime": now.strftime("%Y%m%d%H%M%S")
+    }
+
+    url = "https://api.gdeltproject.org/api/v2/doc/doc"
+
+    for attempt in range(2):
+        response = requests.get(
+            url,
+            params=params,
+            headers={"User-Agent": "IRWorldNewsAssistant/1.0"},
+            timeout=30
+        )
+
+        if response.status_code == 429 and attempt == 0:
+            time.sleep(5)
+            continue
+
+        response.raise_for_status()
+        return response.json().get("articles", [])
+
+    return []
+
+
 if st.button("🔎 Get Latest News"):
     with st.spinner("Searching for international news..."):
         try:
-            now = datetime.now(timezone.utc)
-            start = now - timedelta(days=7)
-
-            params = {
-                "query": queries[category],
-                "mode": "ArtList",
-                "format": "json",
-                "maxrecords": 15,
-                "sort": "DateDesc",
-                "startdatetime": start.strftime("%Y%m%d%H%M%S"),
-                "enddatetime": now.strftime("%Y%m%d%H%M%S")
-            }
-
-            response = requests.get(
-                "https://api.gdeltproject.org/api/v2/doc/doc",
-                params=params,
-                timeout=25
-            )
-            response.raise_for_status()
-            data = response.json()
-            articles = data.get("articles", [])
+            articles = get_news(queries[category])
 
             if not articles:
-                st.info("No articles found. Try another topic.")
+                st.info(
+                    "No articles found right now. "
+                    "Please try again later or choose another topic."
+                )
             else:
                 for article in articles:
                     title = article.get("title", "Untitled")
@@ -77,12 +95,25 @@ if st.button("🔎 Get Latest News"):
 
                     st.divider()
 
-        except Exception as error:
+        except requests.exceptions.HTTPError as error:
+            if error.response is not None and error.response.status_code == 429:
+                st.warning(
+                    "The news service is temporarily limiting requests. "
+                    "Please wait a few minutes and try again."
+                )
+            else:
+                st.error("The news service returned an error.")
+                st.caption(str(error))
+
+        except requests.exceptions.RequestException:
             st.error(
-                "Could not load news right now. "
+                "Could not connect to the news service. "
                 "Please try again later."
             )
-            st.caption(f"Technical detail: {error}")
+
+        except Exception as error:
+            st.error("Something went wrong.")
+            st.caption(str(error))
 
 st.info(
     "Study tip: Connect each news story to Realism, "
