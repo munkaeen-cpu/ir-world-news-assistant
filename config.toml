@@ -1,737 +1,407 @@
-# app.py
-"""
-IR World News Assistant — pastel-pink redesign
-
-- Preserves all existing functionality (GDELT, RSS sources, lecture notes, flashcards, Supabase fallback).
-- Adds a pastel pink aesthetic: pastel pink, baby pink, white, soft lavender.
-- Rounded cards, subtle shadows, clean spacing, emojis and icons for friendly UI.
-- Uses custom CSS for card styling; Streamlit theme is set in .streamlit/config.toml.
-"""
-
-import os
-import sqlite3
-import datetime
-import random
-import hashlib
 import re
-from urllib.parse import quote_plus
+import html
+from datetime import timezone
+from email.utils import parsedate_to_datetime
+from collections import Counter
 
-import requests
 import feedparser
-from bs4 import BeautifulSoup
+import requests
 import streamlit as st
 
-# Optional Postgres driver for Supabase support
-try:
-    import psycopg2
-except Exception:
-    psycopg2 = None
+st.set_page_config(
+    page_title="IR World News Assistant",
+    page_icon="🌍",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-# -----------------------
-# Basic app config
-# -----------------------
-st.set_page_config(page_title="IR Study Space", layout="wide", initial_sidebar_state="expanded")
-
-# Data directory
-DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
-os.makedirs(DATA_DIR, exist_ok=True)
-DB_PATH = os.path.join(DATA_DIR, "data.db")
-
-# External services
-GDELT_DOC_API = "https://api.gdeltproject.org/api/v2/doc/doc"
-
-# RSS feeds requested by you
-RSS_FEEDS = {
-    "BBC": "https://feeds.bbci.co.uk/news/world/rss.xml",
-    "CNN": "https://news.google.com/rss/search?q=when%3A24h+site%3Acnn.com&hl=en-US&gl=US&ceid=US%3Aen",
-    "Reuters": "https://news.google.com/rss/search?q=when%3A24h+site%3Areuters.com&hl=en-US&gl=US&ceid=US%3Aen",
-    "Al Jazeera": "https://www.aljazeera.com/xml/rss/all.xml",
-    "Guardian": "https://www.theguardian.com/world/rss"
-}
-
-# GDELT queries (kept)
-GDELT_QUERIES = {
-    "Wars and conflicts": "war OR conflict OR fighting OR battle OR offensive",
-    "US-China relations": "US China OR United States China OR Sino-American OR US-China",
-    "Russia and Ukraine": "Russia Ukraine OR Russo-Ukrainian OR Russia OR Ukraine",
-    "Middle East": "Middle East OR Israel OR Palestine OR Syria OR Iran OR Yemen OR Lebanon",
-    "United Nations and NATO": "United Nations OR UN OR NATO OR alliance",
-    "International trade and sanctions": "trade OR sanctions OR tariff OR WTO OR trade war",
-    "Mongolia": "Mongolia OR \"Third Neighbor\" OR Ulaanbaatar"
-}
-
-IR_THEORIES = {
-    "Realism": {"definition": "Realism focuses on the state as the main actor...","keywords":["power","security"]},
-    "Liberalism": {"definition": "Liberalism emphasizes institutions and cooperation...","keywords":["institutions","interdependence"]},
-    "Constructivism": {"definition": "Constructivism studies ideas and norms...","keywords":["identity","norms"]},
-    "Marxism": {"definition": "Marxism analyzes class and capitalism...","keywords":["capitalism","class"]},
-    "English School": {"definition": "English School focuses on international society...","keywords":["order","diplomacy"]},
-}
-
-VOCAB = [
-    ("sovereignty", "supreme authority of a state", "төрийн бүрэн эрх"),
-    ("hegemony", "dominant influence of one state", "давамгайлал"),
-    ("soft power", "influence through attraction and culture", "зөөлөн хүч"),
-]
-
-# -----------------------
-# Database support (Supabase fallback)
-# -----------------------
-def get_db_url():
-    try:
-        return st.secrets["db"]["database_url"]
-    except Exception:
-        return os.getenv("DATABASE_URL")
-
-def is_postgres_enabled():
-    return bool(get_db_url()) and psycopg2 is not None
-
-def get_db_connection():
-    db_url = get_db_url()
-    if db_url and psycopg2 is not None:
-        return psycopg2.connect(db_url, sslmode="require")
-    return sqlite3.connect(DB_PATH, check_same_thread=False)
-
-def init_db():
-    conn = get_db_connection()
-    cur = conn.cursor()
-    if is_postgres_enabled():
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS notes (
-            id SERIAL PRIMARY KEY, title TEXT, course TEXT, topic TEXT, tags TEXT, date TEXT, content TEXT, created_at TIMESTAMPTZ DEFAULT NOW()
-        )""")
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS flashcards (
-            id SERIAL PRIMARY KEY, deck TEXT, front TEXT, back TEXT, tags TEXT, created_at TIMESTAMPTZ DEFAULT NOW(), difficulty INTEGER DEFAULT 0
-        )""")
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS articles (
-            id SERIAL PRIMARY KEY, title TEXT, source TEXT, url TEXT UNIQUE, published TEXT, summary TEXT, content_hash TEXT, fetched_at TIMESTAMPTZ DEFAULT NOW()
-        )""")
-    else:
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS notes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, course TEXT, topic TEXT, tags TEXT, date TEXT, content TEXT, created_at TEXT
-        )""")
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS flashcards (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, deck TEXT, front TEXT, back TEXT, tags TEXT, created_at TEXT, difficulty INTEGER DEFAULT 0
-        )""")
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS articles (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, source TEXT, url TEXT UNIQUE, published TEXT, summary TEXT, content_hash TEXT, fetched_at TEXT
-        )""")
-    conn.commit()
-    return conn
-
-conn = init_db()
-
-def db_query(sql, params=(), commit=False):
-    try:
-        if is_postgres_enabled():
-            conn_db = get_db_connection()
-            cur = conn_db.cursor()
-            if params:
-                cur.execute(sql, params)
-            else:
-                cur.execute(sql)
-            if commit:
-                conn_db.commit()
-            return cur
-        else:
-            sqlite_sql = sql.replace("%s", "?")
-            conn_db = get_db_connection()
-            cur = conn_db.cursor()
-            if params:
-                cur.execute(sqlite_sql, params)
-            else:
-                cur.execute(sqlite_sql)
-            if commit:
-                conn_db.commit()
-            return cur
-    except Exception as e:
-        # Keep quiet here; caller will show friendly messages
-        return None
-
-# -----------------------
-# Utilities & fetchers
-# -----------------------
-def short_hash(text):
-    return hashlib.sha1((text or "").encode("utf-8")).hexdigest()
-
-def parse_date_to_iso(date_struct_or_string):
-    if not date_struct_or_string:
-        return ""
-    try:
-        if hasattr(date_struct_or_string, "tm_year"):
-            dt = datetime.datetime(*date_struct_or_string[:6])
-            return dt.isoformat()
-    except Exception:
-        pass
-    try:
-        from dateutil import parser
-        return parser.parse(str(date_struct_or_string)).isoformat()
-    except Exception:
-        return str(date_struct_or_string)
-
-def fetch_gdelt_articles(query, max_records=10):
-    params = {"query": query, "mode": "artlist", "format": "json", "maxrecords": max_records}
-    try:
-        url = GDELT_DOC_API + "?" + "&".join(f"{k}={quote_plus(str(v))}" for k, v in params.items())
-        r = requests.get(url, timeout=12)
-        r.raise_for_status()
-        data = r.json()
-        res = []
-        for item in data.get("articles", [])[:max_records]:
-            title = item.get("title") or item.get("seentitle") or ""
-            link = item.get("url") or item.get("sourceurl") or ""
-            source = item.get("domain") or item.get("source") or "GDELT"
-            published = item.get("seendate") or item.get("date") or ""
-            summary = item.get("excerpt") or ""
-            res.append({
-                "title": title,
-                "url": link,
-                "source": source,
-                "published": parse_date_to_iso(published),
-                "summary": summary,
-                "via": "GDELT",
-                "origin": "GDELT"
-            })
-        return res, None
-    except Exception as e:
-        return [], f"GDELT fetch failed: {e}"
-
-def fetch_rss_feed(feed_name, feed_url, max_items=10):
-    try:
-        parsed = feedparser.parse(feed_url)
-        if hasattr(parsed, "status") and parsed.status and int(parsed.status) >= 400:
-            return [], f"Feed {feed_name} returned HTTP {parsed.status}."
-        if getattr(parsed, "bozo", False) and getattr(parsed, "bozo_exception", None):
-            bozo_exc = parsed.bozo_exception
-            entries = parsed.entries[:max_items]
-            results = []
-            for e in entries:
-                title = getattr(e, "title", "")
-                link = getattr(e, "link", "")
-                source = getattr(parsed.feed, "title", feed_name)
-                published = getattr(e, "published_parsed", None) or getattr(e, "updated_parsed", None) or getattr(e, "published", "")
-                published_iso = parse_date_to_iso(published)
-                summary = getattr(e, "summary", "") or getattr(e, "description", "")
-                cleaned = BeautifulSoup(summary, "html.parser").get_text() if summary else ""
-                results.append({
-                    "title": title,
-                    "url": link,
-                    "source": source,
-                    "published": published_iso,
-                    "summary": cleaned,
-                    "via": "RSS",
-                    "origin": feed_name
-                })
-            return results, f"Warning parsing {feed_name}: {bozo_exc}"
-        entries = parsed.entries[:max_items]
-        results = []
-        for e in entries:
-            title = getattr(e, "title", "")
-            link = getattr(e, "link", "")
-            source = getattr(parsed.feed, "title", feed_name)
-            published = getattr(e, "published_parsed", None) or getattr(e, "updated_parsed", None) or getattr(e, "published", "")
-            published_iso = parse_date_to_iso(published)
-            summary = getattr(e, "summary", "") or getattr(e, "description", "")
-            cleaned = BeautifulSoup(summary, "html.parser").get_text() if summary else ""
-            results.append({
-                "title": title,
-                "url": link,
-                "source": source,
-                "published": published_iso,
-                "summary": cleaned,
-                "via": "RSS",
-                "origin": feed_name
-            })
-        return results, None
-    except Exception as e:
-        return [], f"Failed fetching {feed_name}: {e}"
-
-def fetch_combined_news(sources_filter=None, topics_filter=None, limit_per_feed=10, gdelt_per_topic=6):
-    sources_filter = sources_filter or ["All"]
-    topics_filter = topics_filter or []
-    articles = []
-    feed_errors = []
-    selected_sources = set(sources_filter)
-    want_all = ("All" in selected_sources) or (not selected_sources)
-
-    for name, url in RSS_FEEDS.items():
-        if not want_all and name not in selected_sources:
-            continue
-        res, err = fetch_rss_feed(name, url, max_items=limit_per_feed)
-        if err:
-            feed_errors.append(err)
-        articles.extend(res)
-
-    if want_all or "GDELT" in selected_sources:
-        if topics_filter:
-            topic_map = {
-                "War": ["Wars and conflicts", "Russia and Ukraine", "Middle East"],
-                "Diplomacy": ["United Nations and NATO", "US-China relations"],
-                "International organizations": ["United Nations and NATO"],
-                "Global economy": ["International trade and sanctions"],
-                "Mongolia": ["Mongolia"]
-            }
-            selected_queries = set()
-            for t in topics_filter:
-                selected_queries.update(topic_map.get(t, []))
-            if not selected_queries:
-                selected_queries = set(GDELT_QUERIES.keys())
-        else:
-            selected_queries = set(GDELT_QUERIES.keys())
-
-        for qname in selected_queries:
-            q = GDELT_QUERIES.get(qname, qname)
-            res, err = fetch_gdelt_articles(q, max_records=gdelt_per_topic)
-            if err:
-                feed_errors.append(err)
-            for item in res:
-                item["origin"] = "GDELT"
-                item["gdelt_category"] = qname
-            articles.extend(res)
-
-    if topics_filter:
-        keywords = {
-            "War": ["war","conflict","attack","battle","kill","fighting","offensive"],
-            "Diplomacy": ["diplomacy","talks","summit","meeting","visit","negotiat","dialogue"],
-            "International organizations": ["united nations","un","nato","world bank","imf","wto","eu"],
-            "Global economy": ["trade","sanction","tariff","econom","wto","gdp","market"],
-            "Mongolia": ["mongolia","ulaanbaatar","third neighbor","third-neighbor"]
-        }
-        def matches_topic(item):
-            text = " ".join([item.get("title",""), item.get("summary",""), item.get("source","")]).lower()
-            for t in topics_filter:
-                for kw in keywords.get(t, []):
-                    if kw in text:
-                        return True
-            return False
-        articles = [a for a in articles if matches_topic(a)]
-
-    seen = set()
-    dedup = []
-    for a in articles:
-        url = a.get("url") or ""
-        title = (a.get("title") or "").strip()
-        source = a.get("source") or a.get("origin") or ""
-        key = url or (title + "|" + source)
-        k = short_hash(key)
-        if k in seen:
-            continue
-        seen.add(k)
-        dedup.append(a)
-
-    dedup.sort(key=lambda x: x.get("published") or "", reverse=True)
-    return dedup, feed_errors
-
-# -----------------------
-# Persistence helpers (keep existing logic)
-# -----------------------
-def save_article_to_db(article):
-    url = article.get("url","")
-    title = article.get("title","")
-    source = article.get("source","")
-    published = article.get("published","")
-    summary = article.get("summary","")
-    content_hash = short_hash((title or "") + (url or "") + (summary or ""))
-    fetched_at = datetime.datetime.utcnow().isoformat()
-    try:
-        if is_postgres_enabled():
-            db_query("""
-                INSERT INTO articles (title, source, url, published, summary, content_hash, fetched_at)
-                VALUES (%s, %s, %s, %s, %s, %s, NOW())
-                ON CONFLICT (url) DO NOTHING
-            """, (title, source, url, published, summary, content_hash), commit=True)
-        else:
-            db_query("""
-                INSERT OR IGNORE INTO articles (title, source, url, published, summary, content_hash, fetched_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (title, source, url, published, summary, content_hash, fetched_at), commit=True)
-        return True
-    except Exception:
-        return False
-
-# Basic note/flashcard helpers (unchanged structure)
-def save_note(title, course, topic, tags, date, content):
-    created = datetime.datetime.utcnow().isoformat()
-    tags_str = ",".join(tags) if isinstance(tags, (list, tuple)) else (tags or "")
-    if is_postgres_enabled():
-        db_query("INSERT INTO notes (title, course, topic, tags, date, content, created_at) VALUES (%s,%s,%s,%s,%s,%s,NOW())",
-                 (title, course, topic, tags_str, str(date), content), commit=True)
-    else:
-        db_query("INSERT INTO notes (title, course, topic, tags, date, content, created_at) VALUES (?,?,?,?,?,?,?)",
-                 (title, course, topic, tags_str, str(date), content, created), commit=True)
-
-def list_notes(search=None, course=None, topic=None):
-    sql = "SELECT id, title, course, topic, tags, date, content, created_at FROM notes"
-    clauses=[]; params=[]
-    if search:
-        q=f"%{search}%"
-        clauses.append("(title LIKE ? OR content LIKE ? OR tags LIKE ?)")
-        params.extend([q,q,q])
-    if course:
-        clauses.append("course = ?"); params.append(course)
-    if topic:
-        clauses.append("topic = ?"); params.append(topic)
-    if clauses:
-        sql += " WHERE " + " AND ".join(clauses)
-    sql += " ORDER BY created_at DESC"
-    cur = db_query(sql, params)
-    if cur:
-        try:
-            return cur.fetchall()
-        except Exception:
-            return []
-    return []
-
-def save_flashcard(deck, front, back, tags=None):
-    tags_str = ",".join(tags) if isinstance(tags, (list, tuple)) else (tags or "")
-    if is_postgres_enabled():
-        db_query("INSERT INTO flashcards (deck, front, back, tags, created_at, difficulty) VALUES (%s,%s,%s,%s,NOW(),0)",
-                 (deck, front, back, tags_str), commit=True)
-    else:
-        db_query("INSERT INTO flashcards (deck, front, back, tags, created_at, difficulty) VALUES (?,?,?,?,?,0)",
-                 (deck, front, back, tags_str, datetime.datetime.utcnow().isoformat()), commit=True)
-
-def list_flashcards(deck=None, tag=None):
-    sql = "SELECT id, deck, front, back, tags, difficulty FROM flashcards"
-    clauses=[]; params=[]
-    if deck:
-        clauses.append("deck = ?"); params.append(deck)
-    if tag:
-        clauses.append("tags LIKE ?"); params.append(f"%{tag}%")
-    if clauses:
-        sql += " WHERE " + " AND ".join(clauses)
-    sql += " ORDER BY id ASC"
-    cur = db_query(sql, params)
-    if cur:
-        try:
-            return cur.fetchall()
-        except Exception:
-            return []
-    return []
-
-def update_flashcard_difficulty(card_id, delta):
-    db_query("UPDATE flashcards SET difficulty = difficulty + ? WHERE id=?", (delta, card_id), commit=True)
-
-# --------------------------------
-# Pastel-pink CSS & small helpers
-# --------------------------------
-PASTEL_CSS = """
+# ---- Styling ----
+st.markdown("""
 <style>
-:root{
-  --bg:#fff7fb;
-  --panel:#ffeef6;
-  --card:#fff0f7;
-  --muted:#a28aa3;
-  --accent:#ff8fb1; /* pastel pink */
-  --lav:#e9e1f7;
-  --text:#2b1b2b;
+:root { --pink-900: #74284f; --pink-700: #ad3f79; --pink-500: #d95f9c; --ink: #43243a; }
+.stApp { background: linear-gradient(180deg, #fff8fc 0%, #fff3f9 48%, #fdf7fc 100%); color: var(--ink); }
+.block-container { padding-top: 1.4rem; padding-bottom: 3rem; max-width: 1440px; }
+[data-testid="stSidebar"] { background: linear-gradient(180deg, #74284f 0%, #a63f77 58%, #c6538c 100%); }
+[data-testid="stSidebar"] * { color: #fff7fb !important; }
+[data-testid="stSidebar"] hr { border-color: rgba(255,255,255,.22); }
+.hero {
+  background: radial-gradient(circle at 88% 15%, rgba(255,255,255,.23), transparent 27%), linear-gradient(115deg, #74284f 0%, #ad3f79 53%, #d95f9c 100%);
+  color: white; padding: 1.9rem 2rem; border-radius: 22px; margin-bottom: 1.2rem; box-shadow: 0 12px 30px rgba(173,63,121,.20);
 }
-body { background: var(--bg); color: var(--text); }
-.stApp>main { padding-top: 1rem; }
-.sidebar .sidebar-content { background: linear-gradient(180deg,var(--panel), #fff); border-radius:12px; padding:12px; }
-.card {
-  background: linear-gradient(180deg, rgba(255,240,247,0.9), rgba(255,245,250,0.95));
-  border-radius: 14px;
-  padding: 16px;
-  box-shadow: 0 6px 18px rgba(199, 158, 183, 0.12);
-  border: 1px solid rgba(255,143,177,0.12);
-  margin-bottom: 12px;
-}
-.headline { font-weight:700; color: #2b1b2b; font-size:1.05rem; }
-.muted { color: var(--muted); font-size:0.9rem; }
-.quick-card {
-  border-radius: 12px;
-  background: linear-gradient(180deg,#fff,#fff6fb);
-  padding: 14px;
-  text-align: center;
-  min-height:84px;
-  box-shadow: 0 4px 12px rgba(200, 150, 180, 0.08);
-  transition: transform .12s ease;
-}
-.quick-card:hover { transform: translateY(-4px); }
-.welcome {
-  font-size:1.6rem;
-  font-weight:700;
-  color:#40233a;
-}
-.subtitle { color:#6b4b5f; margin-top:6px; margin-bottom:12px; }
-.small-muted { color:#8f6f86; font-size:0.9rem; }
-.link-btn {
-  background: linear-gradient(90deg, #ff9dbf, #ffc7e0);
-  color: white;
-  padding:8px 12px;
-  border-radius:10px;
-  display:inline-block;
-  text-decoration:none;
-}
+.hero h1 { color: white; font-size: 2.15rem; margin: 0 0 .4rem 0; }
+.hero p { color: #fff0f7; font-size: 1rem; margin: 0; }
+.stat { background: rgba(255,255,255,.92); border: 1px solid #f2c8dd; padding: 1rem; border-radius: 16px; min-height: 85px; box-shadow: 0 4px 16px rgba(173,63,121,.06); }
+.stat-label { color: #96627e; font-size: .85rem; }
+.stat-value { color: #74284f; font-size: 1.3rem; font-weight: 750; margin-top: .2rem; }
+.news-card { background: rgba(255,255,255,.95); border: 1px solid #f0c8dc; border-radius: 17px; padding: 1rem 1.2rem; margin: .7rem 0; box-shadow: 0 5px 18px rgba(116,40,79,.045); }
+.news-title { font-size: 1.05rem; font-weight: 700; line-height: 1.45; color: #572342; margin-bottom: .45rem; }
+.news-meta { color: #946d83; font-size: .82rem; margin-bottom: .6rem; }
+.news-summary { color: #65465a; line-height: 1.65; }
+.tag { display: inline-block; background: #fde4f0; color: #9e326b; padding: .2rem .6rem; border-radius: 999px; font-size: .75rem; font-weight: 700; margin-bottom: .45rem; }
+.study-card { background: #fff; border: 1px solid #f0c8dc; padding: 1rem 1.15rem; border-radius: 15px; margin: .5rem 0; }
+h1, h2, h3, h4 { color: #74284f; }
+a { color: #ad3f79 !important; font-weight: 650; }
+a:hover { color: #74284f !important; }
+div.stButton > button, div[data-testid="stDownloadButton"] > button { background: linear-gradient(100deg, #ad3f79, #d95f9c); color: white; border: 0; border-radius: 11px; font-weight: 700; min-height: 2.55rem; box-shadow: 0 4px 12px rgba(173,63,121,.16); }
+div.stButton > button:hover, div[data-testid="stDownloadButton"] > button:hover { background: #74284f; color: white; border: 0; }
+div[data-baseweb="input"] > div, div[data-baseweb="select"] > div, div[data-baseweb="textarea"] > div { border-color: #efbfd6 !important; border-radius: 11px !important; }
+div[data-testid="stExpander"] { background: rgba(255,255,255,.7); border: 1px solid #f0c8dc; border-radius: 14px; }
 </style>
-"""
+""", unsafe_allow_html=True)
 
-st.markdown(PASTEL_CSS, unsafe_allow_html=True)
+SOURCES = {
+    "BBC News": "https://feeds.bbci.co.uk/news/world/rss.xml",
+    "CNN": "https://rss.cnn.com/rss/edition_world.rss",
+}
+TOPICS = {
+    "All international news": [],
+    "War & conflict": ["war", "conflict", "military", "peace", "attack", "ceasefire", "missile"],
+    "Diplomacy": ["diplomacy", "diplomatic", "foreign policy", "summit", "ambassador", "talks"],
+    "United Nations": ["united nations", "security council", "un secretary", "un chief"],
+    "China–US relations": ["china", "chinese", "united states", "beijing", "washington", "trade war"],
+    "Mongolia foreign policy": ["mongolia", "mongolian", "ulaanbaatar"],
+    "Economy & trade": ["economy", "trade", "tariff", "sanctions", "market", "export"],
+    "Climate & environment": ["climate", "environment", "emissions", "renewable", "warming"],
+}
+THEORY_NOTES = {
+    "Realism": "Focus on state power, national interests, military capability, security, and competition.",
+    "Liberalism": "Focus on cooperation, international organizations, trade, diplomacy, and shared rules.",
+    "Constructivism": "Focus on identity, norms, ideas, historical memory, and how actors understand events.",
+}
+STOPWORDS = set("""
+a an the and or but if then than to of in on at for from by with about into over after before
+is are was were be been being it its this that these those as their they them we our you your
+can could may might will would should have has had do does did not no so such very also more
+most some many much other another each both all any who what when where why how which while
+international relations news says said new latest according report reports amid during against
+""".split())
 
-# -----------------------
-# Sidebar (pastel pink)
-# -----------------------
-def sidebar_navigation():
-    st.sidebar.markdown("<div style='padding:8px;border-radius:10px;background:linear-gradient(180deg,#fff5f9,#fff);text-align:center'><strong style='font-size:1.05rem;'>🌸 IR Study Space</strong><div style='color:#6b4b5f;font-size:0.95rem'>Study, summarize, and review</div></div>", unsafe_allow_html=True)
-    menu = st.sidebar.radio("", ["Home","Dashboard","News Feed","News Analysis","Lecture Notes","Example Generator","Flashcard Maker","Study Mode","IR Theory Guide","Settings"], index=1)
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("Quick actions")
-    if st.sidebar.button("➕ Add Lecture"):
-        st.session_state.page = "Lecture Notes"; st.experimental_rerun()
-    if st.sidebar.button("🃏 Create Flashcards"):
-        st.session_state.page = "Flashcard Maker"; st.experimental_rerun()
-    st.sidebar.markdown("---")
-    # Small stats
+def clean_text(raw):
+    raw = re.sub(r"<[^>]+>", " ", raw or "")
+    return re.sub(r"\s+", " ", html.unescape(raw)).strip()
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_feed(source_url):
+    response = requests.get(
+        source_url,
+        headers={"User-Agent": "Mozilla/5.0 (compatible; IRWorldNewsAssistant/1.0)"},
+        timeout=15,
+    )
+    response.raise_for_status()
+    return feedparser.parse(response.content).entries
+
+def parse_date(entry):
+    raw = entry.get("published") or entry.get("updated") or ""
+    if not raw:
+        return "Date unavailable", 0
     try:
-        note_count = db_query("SELECT COUNT(*) FROM notes").fetchone()[0] if db_query("SELECT COUNT(*) FROM notes") else 0
-    except Exception:
-        note_count = 0
-    try:
-        card_count = db_query("SELECT COUNT(*) FROM flashcards").fetchone()[0] if db_query("SELECT COUNT(*) FROM flashcards") else 0
-    except Exception:
-        card_count = 0
-    st.sidebar.markdown(f"- Notes: **{note_count}**  \n- Flashcards: **{card_count}**")
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("Theme: Pastel Pink • Minimal")
-    return menu
+        dt = parsedate_to_datetime(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.strftime("%d %b %Y"), int(dt.timestamp())
+    except (TypeError, ValueError, OverflowError):
+        return raw, 0
 
-if "page" not in st.session_state:
-    st.session_state.page = "Dashboard"
-
-# -----------------------
-# Dashboard / Home pages
-# -----------------------
-def page_home():
-    st.markdown("<div class='card' style='display:flex;align-items:center;gap:20px;'>"
-                "<div style='flex:1'>"
-                "<div class='welcome'>🌷 Welcome to your IR Study Space</div>"
-                "<div class='subtitle'>Understand the world, one story at a time.</div>"
-                "<div class='small-muted'>Quick access to news, notes, flashcards and practice — tailored for IR students.</div>"
-                "</div>"
-                "<div style='width:260px;text-align:center;'>"
-                "<img src='https://raw.githubusercontent.com/munkaeen-cpu/ir-world-news-assistant/main/assets/pastel-flowers.png' alt='flowers' style='width:220px;border-radius:12px;box-shadow:0 6px 18px rgba(200,150,180,0.08)'/>"
-                "</div>"
-                "</div>", unsafe_allow_html=True)
-
-    st.markdown("<div style='margin-top:14px;display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px'>", unsafe_allow_html=True)
-
-    # Quick access cards
-    def quick_card(title, emoji, dest):
-        return st.button(f"{emoji}  {title}", key=f"quick_{dest}", help=f"Open {title}")
-
-    cols = st.columns(5)
-    with cols[0]:
-        if st.button("📰 World News"):
-            st.session_state.page = "News Feed"; st.experimental_rerun()
-    with cols[1]:
-        if st.button("📝 Lecture Notes"):
-            st.session_state.page = "Lecture Notes"; st.experimental_rerun()
-    with cols[2]:
-        if st.button("🃏 Flashcards"):
-            st.session_state.page = "Flashcard Maker"; st.experimental_rerun()
-    with cols[3]:
-        if st.button("📚 Case Studies"):
-            st.session_state.page = "Example Generator"; st.experimental_rerun()
-    with cols[4]:
-        if st.button("🔁 Study Mode"):
-            st.session_state.page = "Study Mode"; st.experimental_rerun()
-
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    st.markdown("<h3 style='margin-top:22px'>Featured international news</h3>", unsafe_allow_html=True)
-    # Show a featured set of articles
-    articles, errors = fetch_combined_news(limit_per_feed=3, gdelt_per_topic=2)
-    if errors:
-        for e in errors:
-            st.warning(f"Feed message: {e}")
-
-    # Show attractive article cards (first 6)
-    for a in articles[:6]:
-        title = a.get("title") or "Untitled"
-        src = a.get("source") or a.get("origin") or "Unknown"
-        published = a.get("published") or ""
-        summary = (a.get("summary") or "")[:280]
-        url = a.get("url") or ""
-        st.markdown("<div class='card'>", unsafe_allow_html=True)
-        st.markdown(f"<div style='display:flex;gap:12px;align-items:flex-start'>"
-                    f"<div style='width:78%;'><div class='headline'>{title}</div><div class='muted'>{src} • {published or 'Unknown date'}</div><div style='margin-top:8px;color:#4a2a3f'>{summary or '<em>No description available</em>'}</div></div>"
-                    f"<div style='width:22%;text-align:right;'><a class='link-btn' href='{url}' target='_blank'>Open</a></div>"
-                    f"</div>", unsafe_allow_html=True)
-        st.markdown("</div>", unsafe_allow_html=True)
-
-def page_dashboard():
-    # Keep the previous dashboard but styled
-    st.header("Dashboard — IR Study Space")
-    c1, c2 = st.columns([3,2])
-    with c1:
-        st.markdown("<div class='card'><div class='headline'>Latest international headlines</div><div class='muted'>A mix of BBC, CNN, Reuters, Al Jazeera and GDELT results</div></div>", unsafe_allow_html=True)
-        articles, errors = fetch_combined_news(limit_per_feed=3, gdelt_per_topic=2)
-        if errors:
-            for e in errors:
-                st.warning(f"Feed message: {e}")
-        for a in articles[:8]:
-            title = a.get("title") or "Untitled"
-            src = a.get("source") or a.get("origin") or "Unknown"
-            published = a.get("published") or ""
-            summary = (a.get("summary") or "")[:200]
-            url = a.get("url") or ""
-            st.markdown("<div class='card'>", unsafe_allow_html=True)
-            st.markdown(f"<div class='headline'>{title}</div>", unsafe_allow_html=True)
-            st.markdown(f"<div class='muted'>{src} • {published or 'Unknown date'}</div>", unsafe_allow_html=True)
-            st.markdown(f"<div style='margin-top:8px;color:#4a2a3f'>{summary or '<em>No summary available</em>'}</div>", unsafe_allow_html=True)
-            if url:
-                st.markdown(f"<div style='margin-top:8px;text-align:right'><a class='link-btn' href='{url}' target='_blank'>Read original</a></div>", unsafe_allow_html=True)
-            st.markdown("</div>", unsafe_allow_html=True)
-
-    with c2:
-        st.markdown("<div class='card'><div class='headline'>Quick Stats</div><div class='muted'>Your recent activity at a glance</div></div>", unsafe_allow_html=True)
+def get_articles():
+    articles, errors = [], []
+    for source, url in SOURCES.items():
         try:
-            notes = db_query("SELECT COUNT(*) FROM notes").fetchone()[0] if db_query("SELECT COUNT(*) FROM notes") else 0
+            for entry in load_feed(url):
+                title = clean_text(entry.get("title", "Untitled"))
+                summary = clean_text(entry.get("summary", entry.get("description", "")))
+                date_label, timestamp = parse_date(entry)
+                articles.append({
+                    "source": source, "title": title, "summary": summary,
+                    "url": entry.get("link", ""), "date": date_label, "timestamp": timestamp,
+                })
         except Exception:
-            notes = 0
+            errors.append(source)
+    unique, seen = [], set()
+    for article in sorted(articles, key=lambda a: a["timestamp"], reverse=True):
+        key = article["title"].casefold()
+        if key and key not in seen:
+            unique.append(article)
+            seen.add(key)
+    return unique, errors
+
+# ---- Lecture-note tools: offline / no API key ----
+def extract_uploaded_text(uploaded_file):
+    name = uploaded_file.name.lower()
+    data = uploaded_file.getvalue()
+    if name.endswith(".pdf"):
         try:
-            cards = db_query("SELECT COUNT(*) FROM flashcards").fetchone()[0] if db_query("SELECT COUNT(*) FROM flashcards") else 0
-        except Exception:
-            cards = 0
-        st.metric("Saved notes", notes)
-        st.metric("Saved flashcards", cards)
-        st.markdown("<div class='card'><div class='headline'>Daily concept</div></div>", unsafe_allow_html=True)
-        concept = random.choice(list(IR_THEORIES.keys()))
-        st.markdown(f"**{concept}**")
-        st.write(IR_THEORIES[concept]["definition"] if IR_THEORIES.get(concept) else "")
+            from pypdf import PdfReader
+        except ImportError:
+            raise ValueError("PDF уншихад pypdf сан хэрэгтэй. requirements.txt файлдаа pypdf нэмнэ үү.")
+        import io
+        reader = PdfReader(io.BytesIO(data))
+        pages = [(page.extract_text() or "") for page in reader.pages]
+        text = "\n".join(pages)
+        if not text.strip():
+            raise ValueError("PDF-ээс текст уншиж чадсангүй. Энэ нь зураг хэлбэрийн PDF байж магадгүй.")
+        return text
+    if name.endswith(".docx"):
+        try:
+            from docx import Document
+        except ImportError:
+            raise ValueError("Word уншихад python-docx сан хэрэгтэй. requirements.txt файлдаа python-docx нэмнэ үү.")
+        import io
+        doc = Document(io.BytesIO(data))
+        paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
+        for table in doc.tables:
+            for row in table.rows:
+                paragraphs.append(" | ".join(cell.text.strip() for cell in row.cells))
+        return "\n".join(paragraphs)
+    raise ValueError("Зөвхөн PDF эсвэл DOCX файл оруулна уу. Хуучин .doc формат дэмжихгүй.")
 
-# -----------------------
-# News Feed page (keep working)
-# -----------------------
-def page_news_feed():
-    st.header("News Feed")
-    st.markdown("Browse headlines from BBC, CNN (via Google News RSS), Reuters (via Google News RSS), Al Jazeera and GDELT. Headlines, feed summaries (when available), publication dates and links are shown. The app does NOT fetch full article HTML or bypass paywalls.")
-    source_options = ["All","BBC","CNN","Reuters","Al Jazeera","GDELT","Guardian"]
-    source_choice = st.selectbox("Source", source_options, index=0)
-    topic_options = ["War","Diplomacy","International organizations","Global economy","Mongolia"]
-    topic_selected = st.multiselect("Topics", options=topic_options)
-    search_text = st.text_input("Search headlines / sources")
+def split_sentences(text):
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return []
+    parts = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9“\"(])|(?<=。)\s*", text)
+    return [p.strip(" •-\t") for p in parts if len(p.strip()) > 35]
 
-    sources_filter = None if source_choice == "All" else [source_choice]
-    articles, errors = fetch_combined_news(sources_filter=sources_filter, topics_filter=topic_selected, limit_per_feed=10, gdelt_per_topic=4)
-    if errors:
-        for e in errors:
-            st.warning(f"Feed message: {e}")
+def extract_keywords(text, limit=12):
+    words = re.findall(r"\b[a-zA-Z][a-zA-Z'-]{2,}\b", text.lower())
+    counts = Counter(w for w in words if w not in STOPWORDS)
+    return [w for w, _ in counts.most_common(limit)]
 
-    if search_text:
-        q = search_text.lower()
-        articles = [a for a in articles if q in ((a.get("title") or "") + " " + (a.get("summary") or "") + " " + (a.get("source") or "")).lower()]
+def make_notes(text, style="Study notes"):
+    # Transparent extractive baseline: no cloud AI or API key.
+    lines = [re.sub(r"^\s*(?:[-*•]+|\d+[.)])\s*", "", line).strip()
+             for line in text.splitlines() if line.strip()]
+    sentences = split_sentences(text)
+    keywords = extract_keywords(text, 14)
+    if not sentences:
+        sentences = [line for line in lines if len(line) > 25]
+    if not sentences:
+        return {"summary": "Оруулах текст хангалтгүй байна. Илүү урт лекцийн текст оруулна уу.",
+                "points": [], "terms": keywords, "questions": []}
 
-    st.markdown(f"Found {len(articles)} articles")
-    for a in articles:
-        title = a.get("title") or "No title"
-        src = a.get("source") or a.get("origin") or ""
-        published = a.get("published") or "Unknown date"
-        summary = a.get("summary") or ""
-        url = a.get("url") or ""
-        st.markdown("<div class='card'>", unsafe_allow_html=True)
-        st.markdown(f"<div class='headline'>{title}</div>", unsafe_allow_html=True)
-        st.markdown(f"<div class='muted'>{src} • {published}</div>", unsafe_allow_html=True)
-        if summary:
-            st.markdown(f"<div style='margin-top:8px;color:#4a2a3f'>{summary}</div>", unsafe_allow_html=True)
+    # Score sentences for lecture-topic relevance, while preserving original wording.
+    scored = []
+    for idx, sentence in enumerate(sentences):
+        lower = sentence.lower()
+        score = sum(2 for key in keywords[:10] if key in lower)
+        if any(marker in lower for marker in ["is defined as", "refers to", "because", "therefore", "however",
+                                               "main reason", "consequence", "result", "theory", "ideology",
+                                               "important", "caused by", "leads to"]):
+            score += 2
+        if len(sentence) > 300:
+            score -= 1
+        scored.append((score, idx, sentence))
+    top = sorted(scored, key=lambda item: (item[0], -item[1]), reverse=True)
+    chosen = sorted(top[:min(8, len(top))], key=lambda item: item[1])
+    points = [sentence for _, _, sentence in chosen]
+    summary = " ".join(points[:3])
+    questions = []
+    for term in keywords[:5]:
+        questions.append(f"What does “{term}” mean in the context of this lecture?")
+    return {"summary": summary, "points": points, "terms": keywords, "questions": questions}
+
+def build_example(notes_text, theory):
+    text = notes_text.strip()
+    low = text.lower()
+    examples = {
+        "Realism": (
+            "Possible example: competition between the United States and China.",
+            "Use this only if your notes discuss state power, security, national interests, or competition. "
+            "Explain each country's interests, then connect those interests to the theory's focus on power and security."
+        ),
+        "Liberalism": (
+            "Possible example: countries cooperating through the United Nations.",
+            "Use this only if your notes discuss cooperation, institutions, diplomacy, trade, or shared rules. "
+            "Explain how an organization or agreement helps states work together."
+        ),
+        "Constructivism": (
+            "Possible example: how national identity and historical memory influence foreign policy.",
+            "Use this only if your notes discuss identity, ideas, norms, values, or shared beliefs. "
+            "Explain how these ideas shape an actor's understanding of its interests."
+        ),
+    }
+    headline, explanation = examples[theory]
+    if theory == "Realism" and not any(w in low for w in ["power", "security", "state", "interest", "realism"]):
+        caveat = "Your notes do not clearly mention the usual Realism keywords, so check that this example fits the lecture."
+    elif theory == "Liberalism" and not any(w in low for w in ["cooperation", "institution", "trade", "liberal", "organization"]):
+        caveat = "Your notes do not clearly mention the usual Liberalism keywords, so check that this example fits the lecture."
+    elif theory == "Constructivism" and not any(w in low for w in ["identity", "norm", "idea", "constructiv", "belief", "value"]):
+        caveat = "Your notes do not clearly mention the usual Constructivism keywords, so check that this example fits the lecture."
+    else:
+        caveat = "This is an illustrative example, not a claim that the lecture explicitly used this case."
+    return headline, explanation, caveat
+
+# ---- Navigation ----
+with st.sidebar:
+    st.markdown("## 🌍 IR World News")
+    st.caption("News + lecture study workspace")
+    page = st.radio(
+        "NAVIGATION",
+        ["🏠 Home", "📰 Latest News", "📝 Lecture Notes", "📚 IR Theory Lab", "🌏 Mongolia Focus", "ℹ️ About"],
+        label_visibility="collapsed",
+    )
+    st.markdown("---")
+    st.markdown("**QUICK LINKS**")
+    st.markdown("[BBC World News ↗](https://www.bbc.com/news/world)")
+    st.markdown("[CNN World ↗](https://edition.cnn.com/world)")
+    st.markdown("[United Nations ↗](https://news.un.org/)")
+    st.markdown("---")
+    st.caption("For International Relations students")
+
+st.markdown("""
+<div class="hero">
+  <h1>Stay informed. Think globally. 🌐</h1>
+  <p>Follow international headlines, turn lectures into study notes, and practise applying IR theories.</p>
+</div>
+""", unsafe_allow_html=True)
+
+if "articles" not in st.session_state:
+    st.session_state.articles = []
+if "feed_errors" not in st.session_state:
+    st.session_state.feed_errors = []
+
+if page == "📝 Lecture Notes":
+    st.markdown("## 📝 Lecture Notes Studio")
+    st.write("PDF, DOCX эсвэл лекцийн текстээ оруулаад тэмдэглэл, гол нэр томьёо, жишээ, шалгалтын асуулт бэлдээрэй.")
+    st.info("API түлхүүргүй хувилбар: таны оруулсан текстийг төхөөрөмж дээр биш, Streamlit апп ажиллаж буй орчинд боловсруулна. Энэ нь сонгосон өгүүлбэрүүдийг ялгаж, түлхүүр үг олдог энгийн арга бөгөөд бүрэн AI ойлголт биш.")
+    tab_file, tab_text = st.tabs(["📄 Upload PDF / Word", "✍️ Paste lecture text"])
+    with tab_file:
+        uploaded = st.file_uploader("Choose a lecture file", type=["pdf", "docx"], help="PDF эсвэл .docx файл. Хуучин .doc формат дэмжихгүй.")
+        file_text = ""
+        if uploaded:
+            try:
+                file_text = extract_uploaded_text(uploaded)
+                st.success(f"Текст уншлаа: ойролцоогоор {len(file_text.split())} үг.")
+            except Exception as exc:
+                st.error(str(exc))
+    with tab_text:
+        pasted_text = st.text_area("Paste your lecture transcript or notes here", height=260,
+                                   placeholder="Paste lecture transcript, textbook notes, or class notes…")
+    input_mode = st.radio("Тэмдэглэл гаргах эх сурвалж", ["Uploaded file", "Pasted text"], horizontal=True)
+    source_text = file_text if input_mode == "Uploaded file" else pasted_text
+    note_style = st.selectbox("Output style", ["Study notes", "Short exam revision", "Key concepts and definitions"])
+    if st.button("✨ Create lecture notes", type="primary", use_container_width=True):
+        if len(source_text.strip()) < 100:
+            st.warning("Илүү дэлгэрэнгүй лекц оруулна уу (дор хаяж 100 тэмдэгт).")
         else:
-            st.markdown("<div style='margin-top:8px;color:#6b4b5f'><em>No feed summary available</em></div>", unsafe_allow_html=True)
-        if url:
-            st.markdown(f"<div style='margin-top:8px;text-align:right'><a class='link-btn' href='{url}' target='_blank'>Open original</a></div>", unsafe_allow_html=True)
-        st.markdown("</div>", unsafe_allow_html=True)
-        col1, col2 = st.columns([1,1])
-        with col1:
-            if st.button("Save article", key=f"save_{short_hash(url)}"):
-                ok = save_article_to_db({"title": title, "url": url, "source": src, "published": published, "summary": summary})
-                if ok:
-                    st.success("Saved article.")
-                else:
-                    st.info("Article may already exist or save failed.")
-        with col2:
-            if st.button("Save to notes", key=f"note_{short_hash(url)}"):
-                st.session_state.prefill_note = {"title": title, "content": f"Source: {src}\nURL: {url}\n\n{summary}\n\nYour analysis:"}
-                st.session_state.page = "Lecture Notes"; st.experimental_rerun()
+            st.session_state.generated_notes = make_notes(source_text, note_style)
+            st.session_state.original_lecture = source_text
+            st.session_state.note_style = note_style
 
-# -----------------------
-# News Analysis, Lecture Notes, Example Generator, Flashcards, Study Mode, IR Guide, Settings
-# Keep existing implementations — they are preserved in the app to avoid breaking functionality.
-# For brevity we call the same function definitions that exist in your original file.
-# If those functions are defined above in this file they will be used unchanged.
-# -----------------------
-
-# Use existing definitions if present; else show informational placeholders.
-try:
-    page_news_analysis  # noqa
-except NameError:
-    def page_news_analysis():
-        st.info("News Analysis page placeholder. Restore original implementation if missing.")
-
-try:
-    page_lecture_notes  # noqa
-except NameError:
-    def page_lecture_notes():
-        st.info("Lecture Notes page placeholder. Restore original implementation if missing.")
-
-try:
-    page_example_generator  # noqa
-except NameError:
-    def page_example_generator():
-        st.info("Example Generator page placeholder. Restore original implementation if missing.")
-
-try:
-    page_flashcard_maker  # noqa
-except NameError:
-    def page_flashcard_maker():
-        st.info("Flashcard Maker page placeholder. Restore original implementation if missing.")
-
-try:
-    page_study_mode  # noqa
-except NameError:
-    def page_study_mode():
-        st.info("Study Mode page placeholder. Restore original implementation if missing.")
-
-try:
-    page_ir_theory_guide  # noqa
-except NameError:
-    def page_ir_theory_guide():
-        st.info("IR Theory Guide page placeholder. Restore original implementation if missing.")
-
-def page_settings():
-    st.header("Settings")
-    st.markdown("UI theme: Pastel Pink (custom CSS + Streamlit theme). Data storage: local SQLite by default; Supabase Postgres optional via Streamlit secrets.")
-    st.markdown("Local DB path: " + DB_PATH)
-    if st.button("Reset session state"):
-        for k in list(st.session_state.keys()):
-            del st.session_state[k]
-        st.experimental_rerun()
-
-# Router
-page = sidebar_navigation()
-if page == "Home":
-    page_home()
-elif page == "Dashboard":
-    page_dashboard()
-elif page == "News Feed":
-    page_news_feed()
-elif page == "News Analysis":
-    page_news_analysis()
-elif page == "Lecture Notes":
-    page_lecture_notes()
-elif page == "Example Generator":
-    page_example_generator()
-elif page == "Flashcard Maker":
-    page_flashcard_maker()
-elif page == "Study Mode":
-    page_study_mode()
-elif page == "IR Theory Guide":
-    page_ir_theory_guide()
-elif page == "Settings":
-    page_settings()
+    if "generated_notes" in st.session_state:
+        notes = st.session_state.generated_notes
+        st.markdown("---")
+        st.markdown("### Your lecture notes")
+        st.markdown("**Main idea / гол санаа**")
+        st.write(notes["summary"])
+        st.markdown("**Key points / чухал санаанууд**")
+        for point in notes["points"]:
+            st.markdown(f"- {point}")
+        st.markdown("**Keywords / түлхүүр үгс**")
+        if notes["terms"]:
+            st.write(" · ".join(notes["terms"]))
+        else:
+            st.write("Түлхүүр үг илэрсэнгүй.")
+        st.markdown("### 🧠 Generate an example from these notes")
+        theory = st.selectbox("Choose an IR theory", list(THEORY_NOTES.keys()))
+        if st.button("Create theory-based example"):
+            example, explanation, caveat = build_example(st.session_state.original_lecture, theory)
+            st.session_state.last_example = (theory, example, explanation, caveat)
+        if "last_example" in st.session_state:
+            theory_saved, example, explanation, caveat = st.session_state.last_example
+            st.markdown(f'<div class="study-card"><span class="tag">{html.escape(theory_saved)}</span><h4>{html.escape(example)}</h4><p>{html.escape(explanation)}</p><p><b>Note:</b> {html.escape(caveat)}</p></div>', unsafe_allow_html=True)
+        st.markdown("### 📝 Practice questions")
+        for i, question in enumerate(notes["questions"], start=1):
+            st.markdown(f"{i}. {question}")
+        st.download_button("⬇️ Download notes as TXT", data=(
+            "IR WORLD NEWS ASSISTANT — LECTURE NOTES\n\nMAIN IDEA\n" + notes["summary"] +
+            "\n\nKEY POINTS\n" + "\n".join("- " + p for p in notes["points"]) +
+            "\n\nKEYWORDS\n" + ", ".join(notes["terms"]) +
+            "\n\nPRACTICE QUESTIONS\n" + "\n".join(notes["questions"])
+        ), file_name="ir_lecture_notes.txt", mime="text/plain")
+    st.caption("Tip: Review the generated notes against your original lecture. This no-key version may miss context or select less important sentences.")
+elif page == "📚 IR Theory Lab":
+    st.markdown("## 📚 IR Theory Lab")
+    st.write("Use these lenses to analyse a current event.")
+    for theory, description in THEORY_NOTES.items():
+        with st.expander(theory, expanded=(theory == "Realism")):
+            st.write(description)
+            if theory == "Realism":
+                st.write("Guiding questions: Which actors have power? What security concerns or national interests are involved?")
+            elif theory == "Liberalism":
+                st.write("Guiding questions: Which institutions, agreements, or shared interests encourage cooperation?")
+            else:
+                st.write("Guiding questions: How do identities, norms, or historical narratives shape decisions?")
+    st.markdown("**Short-answer structure**")
+    st.code("1. Define the theory.\\n2. Explain its main idea.\\n3. Give one relevant example.\\n4. Explain why the example fits.")
+elif page == "ℹ️ About":
+    st.markdown("## About IR World News Assistant")
+    st.write("A study dashboard for International Relations students. It combines publisher RSS headlines with an offline-style lecture-note helper.")
+    st.warning("The lecture helper does not use a large language model. Its notes and examples are a first draft; verify facts and course concepts against the original lecture.")
+elif page == "🌏 Mongolia Focus":
+    if not st.session_state.articles:
+        with st.spinner("Loading news feeds..."):
+            st.session_state.articles, st.session_state.feed_errors = get_articles()
+    q = st.text_input("Search Mongolia-related news", placeholder="Mongolia, Ulaanbaatar, foreign policy…")
+    visible = [a for a in st.session_state.articles if any(k in (a["title"] + " " + a["summary"]).lower() for k in TOPICS["Mongolia foreign policy"])]
+    if q.strip():
+        visible = [a for a in visible if q.casefold() in (a["title"] + " " + a["summary"]).casefold()]
+    if not visible:
+        st.info("No Mongolia-related headlines found in the currently loaded feeds. Try refreshing or search publisher websites.")
+    for a in visible[:20]:
+        st.markdown(f'<div class="news-card"><div class="tag">MONGOLIA FOCUS</div><div class="news-title">{html.escape(a["title"])}</div><div class="news-meta">{html.escape(a["source"])} · {html.escape(a["date"])}</div><p>{html.escape(a["summary"][:500])}</p><a href="{html.escape(a["url"], quote=True)}" target="_blank" rel="noopener noreferrer">Read original article ↗</a></div>', unsafe_allow_html=True)
 else:
-    st.info("Select a page from the sidebar.")
+    if page == "🏠 Home":
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.markdown('<div class="stat"><div class="stat-label">🗞️ News sources</div><div class="stat-value">BBC · CNN</div></div>', unsafe_allow_html=True)
+        with c2:
+            st.markdown('<div class="stat"><div class="stat-label">📝 Study tools</div><div class="stat-value">Lecture notes</div></div>', unsafe_allow_html=True)
+        with c3:
+            st.markdown('<div class="stat"><div class="stat-label">🎓 Practice</div><div class="stat-value">IR theories</div></div>', unsafe_allow_html=True)
+    if not st.session_state.articles:
+        with st.spinner("Connecting to BBC and CNN feeds..."):
+            st.session_state.articles, st.session_state.feed_errors = get_articles()
+    if st.session_state.feed_errors:
+        st.warning("Could not reach: " + ", ".join(st.session_state.feed_errors) + ". A publisher feed may be temporarily unavailable.")
+    col_left, col_right = st.columns([4, 1])
+    with col_left:
+        st.markdown("## 📰 International news desk")
+        st.caption("Publisher RSS headlines · Open original stories for full context")
+    with col_right:
+        if st.button("🔄 Refresh news", type="primary", use_container_width=True):
+            load_feed.clear()
+            st.session_state.articles, st.session_state.feed_errors = get_articles()
+            st.rerun()
+    f1, f2, f3 = st.columns([2, 2, 2])
+    with f1:
+        search = st.text_input("🔎 Search headlines", placeholder="Country, event, keyword…")
+    with f2:
+        topic = st.selectbox("Topic", list(TOPICS.keys()))
+    with f3:
+        source_filter = st.selectbox("Source", ["All sources", *SOURCES.keys()])
+    visible = st.session_state.articles
+    if TOPICS[topic]:
+        visible = [a for a in visible if any(k in (a["title"] + " " + a["summary"]).lower() for k in TOPICS[topic])]
+    if source_filter != "All sources":
+        visible = [a for a in visible if a["source"] == source_filter]
+    if search.strip():
+        term = search.casefold()
+        visible = [a for a in visible if term in (a["title"] + " " + a["summary"]).casefold()]
+    st.caption(f"Showing {min(len(visible), 20)} of {len(visible)} matching headlines")
+    if not visible:
+        st.info("No matching headlines. Try another topic or search term.")
+    for a in visible[:20]:
+        st.markdown(
+            f'<div class="news-card"><div class="tag">{html.escape(a["source"].upper())}</div>'
+            f'<div class="news-title">{html.escape(a["title"])}</div>'
+            f'<div class="news-meta">🗓️ {html.escape(a["date"])} &nbsp; · &nbsp; 📰 {html.escape(a["source"])}</div>'
+            f'<div class="news-summary">{html.escape(a["summary"][:600]) or "No summary supplied by the feed."}</div>'
+            f'<br><a href="{html.escape(a["url"], quote=True)}" target="_blank" rel="noopener noreferrer">Read original article ↗</a></div>',
+            unsafe_allow_html=True,
+        )
+
+st.markdown("---")
+with st.expander("🎓 Study tip: connect news to IR theory"):
+    chosen_theory = st.selectbox("Choose a theory", list(THEORY_NOTES.keys()), key="footer_theory")
+    st.write(THEORY_NOTES[chosen_theory])
+st.caption("IR World News Assistant · Educational use · Verify lecture notes and news against original sources.")
